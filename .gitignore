@@ -74,5 +74,9 @@ Testing/
 
 # visual studio
 .vs/
+.vscode/
 *.vcxproj.filters
 *.vcxproj.user
+
+# github
+.github/
