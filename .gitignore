@@ -68,6 +68,9 @@ vcpkg_installed/
 # debug information files
 *.dwo
 
+# test files
+*.ini
+
 # test output & cache
 Testing/
 .cache/
@@ -78,5 +81,10 @@ Testing/
 *.vcxproj.filters
 *.vcxproj.user
 
+<<<<<<< HEAD
 # github
 .github/
+=======
+# Copilot 
+.github/
+>>>>>>> latest_update

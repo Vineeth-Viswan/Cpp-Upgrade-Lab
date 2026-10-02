@@ -1,0 +1,7 @@
+<Solution>
+  <Configurations>
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="ConstrainedAlgApp.vcxproj" Id="ef2385e1-31f4-42ef-bf3b-702951d6872f" />
+</Solution>
