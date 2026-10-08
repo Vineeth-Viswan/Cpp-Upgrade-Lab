@@ -6,6 +6,7 @@
 #include <string_view>
 #include <optional>
 #include <string>
+#include <functional>
 
 enum class LogLevel
 {
@@ -60,5 +61,18 @@ struct LogEntry
     std::string message;
     size_t line_number;
 };
+
+// Hash specialization for LogLevel to use as unordered_map key
+namespace std
+{
+    template <>
+    struct hash<LogLevel>
+    {
+        size_t operator()(const LogLevel& level) const noexcept
+        {
+            return std::hash<int>()(static_cast<int>(level));
+        }
+    };
+}
 
 #endif // !LOG_TYPES

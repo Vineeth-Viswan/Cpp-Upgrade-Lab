@@ -21,21 +21,21 @@ template<std::ranges::viewable_range Range>
 auto ParsedEntries (Range &&lines)
 {
     return std::views::all (std::forward<Range> (lines)) | std::views::transform (ParseLine)
-           | std::views::filter ([] (const std::optional<LogEntry> &entry) { return entry.has_value (); })
-           | std::views::transform ([] (const std::optional<LogEntry> &entry) { return *entry; });
+            | std::views::filter ([](const std::optional<LogEntry>& entry) { return entry.has_value (); })
+            | std::views::transform ([] (const std::optional<LogEntry>& entry) { return *entry;});
+}
+
+template<std::ranges::viewable_range Range>
+auto ByLevel (Range &&entries, LogLevel level)
+{
+    return std::views::all (std::forward<Range> (entries)) 
+      | std::views::filter ([level] (const LogEntry &entry) { return entry.level == level;});
 }
 
 template<std::ranges::viewable_range Range>
 auto WarningOrErrorEntries (Range &&lines)
 {
     return ParsedEntries (SignificantLines (std::forward<Range> (lines)));
-}
-
-template<std::ranges::viewable_range Range>
-auto ByLevel (Range &&entries, LogLevel level)
-{
-    return std::views::all (std::forward<Range> (entries))
-           | std::views::filter ([level] (const LogEntry &entry) { return entry.level == level; });
 }
 
 template<std::ranges::viewable_range Range>
@@ -63,6 +63,5 @@ auto Windowed (Range &&entries, std::size_t count, std::size_t skip)
 {
     return std::views::all (std::forward<Range> (entries)) | std::views::drop (skip) | std::views::take (count);
 }
-
 
 #endif // !LOG_PIPELINE

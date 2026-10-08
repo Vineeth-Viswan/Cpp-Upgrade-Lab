@@ -152,6 +152,7 @@
     <ClInclude Include="include\log_pipeline.h" />
     <ClInclude Include="include\log_summary.h" />
     <ClInclude Include="include\log_types.h" />
+    <ClInclude Include="include\report_formatter.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="source\main.cpp" />
