@@ -25,6 +25,11 @@ not performance optimization — it's to build intuition for what ranges cost
 or save in terms of readability, compile time, and (roughly) runtime
 behavior.
 
+This week stays strictly within C++20 — no C++26 features. In the broader
+weekly plan, C++26 work shows up much later (reflection, contracts,
+sender/receiver, roughly weeks 12+), so Week 4's scope is the ranges library
+on its own, done well.
+
 ## 2. Learning Objectives Mapped to the Project
 
 | Goal | Where it shows up in the project |
@@ -33,7 +38,65 @@ behavior.
 | Replace manual loops with composable pipelines | Direct refactor of the Week 1/2 loop-based parser |
 | Distinguish owning containers vs. lazy views | Explicit separation between "load" (owning) and "process" (view) stages |
 
-## 3. Modules / Components
+## 3. What Needs to Be Done
+
+This is the concrete task list — the "what," not the "how." Each item maps
+onto a specific module in Sections 4–5 below.
+
+1. **Lock down the data model** — `LogLevel` enum class, `LogEntry` struct
+   (level, timestamp, source/module, message, line number). This has to be
+   stable before anything else, since it's the type every view in the
+   pipeline will eventually produce.
+2. **Loading strategy: eager `vector<string>`** (decided — matches the
+   Week 1/2 baseline). `LogSource` reads the whole file up front into an
+   owning container. Because numbering has to happen while the file is
+   still being walked sequentially (see task #3), the container is really
+   `vector<RawLine>` — each line paired with its original position at the
+   moment it's read, not bare `string`. This keeps the eager/owning stage
+   isolated to `log_loading`, so everything downstream still composes as
+   lazy views over that one owning container.
+3. **Line numbering lives in `log_loading`, not `log_parsing`** —
+   `RawLine { size_t line_number; string text; }` is produced once, as
+   each line is read, and carried through the rest of the pipeline.
+   `parse_line` stays pure (no state, no I/O) but now takes a `RawLine`
+   instead of bare `string_view`, and copies `.line_number` straight into
+   `LogEntry` — it doesn't compute or guess the number itself. This
+   matters because filtering happens before parsing (task #4): numbering
+   downstream of a filter would number "the 3rd warning," not "line 3 of
+   the file," which isn't what `LogEntry::line_number` is supposed to mean.
+4. **Write the filter predicates separately from the parser** — a cheap
+   predicate on raw lines ("does this look like a warning/error before we
+   bother parsing it"), plus predicates for the other scoped filters
+   (by severity, by timestamp range, by module/source — see Section 9).
+   Named, testable predicates rather than inline lambdas pay off once you
+   want to unit test them in isolation.
+5. **Build the pipeline as composition, not a do-everything class** — a
+   small set of functions that each return a view, meant to be chained:
+   a stage that filters to warnings/errors, a stage that parses matching
+   lines, optional windowing stages. Resist wrapping this in one big
+   `Pipeline` class with a dozen methods — that fights the adaptor model
+   rather than embracing it (see Section 6).
+6. **Implement the summary/aggregation step** — the terminal ("sink")
+   stage where the lazy view actually gets consumed, via `ranges::for_each`
+   or manual accumulation into an `unordered_map<LogLevel, size_t>`. This
+   is also where "top errors" / most-frequent-pattern reporting lives, if
+   you take on that stretch feature (Section 9).
+7. **Write the report formatter** — takes the finished counts, produces
+   printed output. Nothing range-specific here; keep it presentation-only.
+8. **Build the loop-based baseline** — needs to exist before or alongside
+   the ranges version, since the benchmark/comparison task depends on
+   having both to compare.
+9. **Time + compare** — rough `std::chrono` wrap around both
+   implementations on the same input, plus a short written note on what
+   changed: readability, where laziness actually saved work, whether the
+   pipeline was harder to debug. Also note, concretely, where eager
+   materialization happened vs. where views stayed lazy end-to-end — this
+   is one of the week's explicit learning goals.
+10. **Write the end-of-week note** — per the overall plan's convention:
+    what changed, what felt useful, what still feels unclear. Keep this
+    short; it's meant to be a quick retro, not a report.
+
+## 4. Modules / Components
 
 The project is organized as a small set of focused headers (and matching
 source/test files), consistent with the header-oriented style used in the
@@ -50,17 +113,21 @@ responsibilities and boundaries only.
 
 2. **`log_loading`**
    - Responsible for the one owning, eager step in the pipeline: reading
-     lines from a file (or stream/istream) into an owning container
-     (e.g. `std::vector<std::string>`).
-   - This is intentionally kept separate and eager, so the boundary between
-     "owning data" and "lazy view over data" is explicit and easy to point
-     to when discussing the view/adaptor model.
+     the whole file into `std::vector<RawLine>`, pairing each line's text
+     with its 1-based position in the file as it's read.
+   - This is the only module that performs I/O, the only module that owns
+     memory in the eager sense, and — because numbering requires walking
+     the file in order — the only correct place for `line_number` to be
+     assigned. Everything downstream operates on lazy views over this one
+     owning container, so the owning-vs-lazy boundary sits at exactly this
+     module's edge.
 
 3. **`log_parsing`**
-   - Contains the field-extraction logic: turning a raw line
-     (`std::string`/`std::string_view`) into a `LogEntry`, or into
-     `std::optional<LogEntry>` for lines that don't match the expected
-     format.
+   - Contains the field-extraction logic: turning a `RawLine` into a
+     `LogEntry`, or into `std::optional<LogEntry>` for lines that don't
+     match the expected format. `line_number` is copied through from the
+     `RawLine`, not recomputed — `log_parsing` has no concept of position
+     in the file, only of individual line content.
    - Designed to be used inside `views::transform` (and paired with a
      `views::filter` for lines that fail to parse), so this logic is a
      small, pure, composable function rather than something embedded in a
@@ -74,15 +141,18 @@ responsibilities and boundaries only.
      - a stage that filters raw lines down to warnings/errors,
      - a stage that maps matching lines to `LogEntry` values,
      - optional windowing stages (`take`/`drop`) for things like "first N
-       errors" or "skip the first N lines as a header/warm-up period".
+       errors" or "skip the first N lines as a header/warm-up period",
+     - optional scoped filters by severity, timestamp range, or module
+       (Section 9 stretch features).
    - This module is where the "manual loop → pipeline" rewrite actually
      lives, and where the loop-based vs. ranges-based comparison will be
      drawn most directly.
 
 5. **`log_summary`**
    - Consumes the pipeline output and produces aggregate results: counts by
-     level, counts by source/module, or similar. This is the terminal
-     ("sink") stage where lazy views finally get evaluated (e.g. via
+     level, counts by source/module, or similar, plus optionally a
+     top-N most-frequent-pattern report. This is the terminal ("sink")
+     stage where lazy views finally get evaluated (e.g. via
      `ranges::for_each`, `ranges::distance`, or accumulation into a map).
    - Kept separate from `log_pipeline` so the plan clearly distinguishes
      "building a lazy computation" from "forcing/consuming it."
@@ -99,7 +169,88 @@ responsibilities and boundaries only.
      correctness, summary correctness), plus one small comparison test or
      scratch file used for the loop-vs-ranges benchmark task.
 
-## 4. Library Structuring
+## 5. Class-Level Layout and Interactions
+
+Deliberately light on classes — parsing and pipeline logic are free
+functions/namespaces rather than stateful objects, because that's the idiom
+ranges actually wants: composable functions returning views, not objects
+that "own" a pipeline.
+
+```
+LogLevel (enum class)
+    DEBUG, INFO, WARNING, ERROR
+    + to_string(LogLevel) -> string_view
+    + from_string(string_view) -> optional<LogLevel>
+
+RawLine (struct — plain data, pairs text with its original file position)
+    size_t    line_number    // 1-based, assigned once, while reading
+    string    text
+
+LogEntry (struct — plain data, no behavior)
+    LogLevel level
+    string    timestamp
+    string    source
+    string    message
+    size_t    line_number    // copied from RawLine.line_number during parsing, never recomputed
+
+LogSource (class — owns the I/O boundary; eager)
+    - opens/reads the file
+    + lines() -> vector<RawLine>   // reads the whole file up front, numbering each line as it's read
+    (this is the ONLY class that touches the filesystem/istream, and the
+     ONLY place line_number is assigned — by construction, not by a counter
+     threaded through later stages)
+
+LogParser (free functions, not a class — it's stateless)
+    + parse_line(const RawLine&) -> optional<LogEntry>   // copies .line_number into LogEntry, doesn't compute it
+    + looks_like_warning_or_error(const RawLine&) -> bool   // cheap pre-filter; inspects .text only
+
+LogPipeline (free functions returning views — not a class)
+    + significant_lines(range<RawLine>)  -> filter(looks_like_warning_or_error)
+    + parsed_entries(range<RawLine>)     -> significant_lines | transform(parse_line) | filter(has_value) | transform(*)
+    + by_level(range<LogEntry>, LogLevel)        -> filter    // stretch: severity scope
+    + in_time_range(range<LogEntry>, lo, hi)     -> filter    // stretch: timestamp scope
+    + by_module(range<LogEntry>, string_view)    -> filter    // stretch: module scope
+    + windowed(range<LogEntry>, n, skip)         -> drop(skip) | take(n)     // optional, only if reporting needs it
+
+LogSummary (class — the one place laziness gets consumed)
+    - counts: unordered_map<LogLevel, size_t>
+    - pattern_counts: unordered_map<string, size_t>   // only if doing top-N stretch feature
+    + LogSummary::from(range<LogEntry>)  -> builds itself via for_each/accumulation
+    + count_for(LogLevel) -> size_t
+    + total() -> size_t
+    + top_n(size_t) -> vector<pair<string, size_t>>   // optional stretch
+
+ReportFormatter (class or free function — presentation only)
+    + format(const LogSummary&) -> string
+    + print(const LogSummary&, ostream&)
+```
+
+**How they interact:** `LogSource` eagerly reads the file once and produces
+an owning `vector<RawLine>`, numbering each line as it's read — this is the
+only point in the whole pipeline where a position/counter is assigned →
+`LogPipeline` functions compose lazy views over that vector and hand back a
+`LogEntry` view (nothing is filtered, parsed, or copied until this view is
+actually iterated) → `LogSummary::from(...)` is the terminal call that pulls
+values through the pipeline and materializes counts, with each `LogEntry`
+already carrying the correct `line_number` from its originating `RawLine`
+→ `ReportFormatter` reads the finished `LogSummary` and produces output.
+Dependency direction is strictly left-to-right in that list —
+`LogEntry`/`LogLevel`/`RawLine` are the only things everyone depends on;
+`LogSource` knows nothing about parsing; `LogPipeline` knows nothing about
+I/O or summarization; `LogSummary` knows nothing about formatting.
+
+This also means filtering never corrupts the line count: because
+`line_number` is fixed at read time, a `LogEntry` that survives
+`significant_lines | parsed_entries` (and any of the stretch filters)
+always reports its true position in the original file, not its position
+among survivors.
+
+If you find yourself wanting a `Pipeline` class with a fluent
+`.filter().transform().take()` interface, that's really just re-deriving
+what `|` composition already gives you for free — worth resisting unless
+you specifically want the practice of writing your own adaptor.
+
+## 6. Library Structuring
 
 Suggested directory layout (mirrors the header-oriented structure from the
 Week 3 project, adapted for this week's scope):
@@ -129,9 +280,9 @@ week4-log-analyzer/
 Design intent behind this structuring:
 - **`log_types` has no dependencies** on the other modules — it's the
   shared vocabulary everything else builds on.
-- **`log_loading` is the only module that performs I/O and owns memory**
-  in the eager sense. Everything downstream of it operates on views over
-  that owned data, which keeps the "owning vs. lazy" distinction visible
+- **`log_loading` is the only module that performs I/O** (and owns memory,
+  in the eager case). Everything downstream of it operates on views over
+  that data, which keeps the "owning/sourcing vs. lazy" distinction visible
   at the architecture level, not just in isolated code snippets.
 - **`log_pipeline` depends only on `log_types` and `log_parsing`**, and
   exposes range-returning functions rather than containers, so callers can
@@ -144,7 +295,7 @@ Design intent behind this structuring:
   understanding/comparison (per the task's explicit "not for premature
   optimization" framing), not correctness verification.
 
-## 5. Implementation Notes / Considerations
+## 7. Implementation Notes / Considerations
 
 - **Header-only vs. compiled**: Given the Week 3 project was header-only,
   this week can either continue that convention for `log_pipeline` and
@@ -178,13 +329,25 @@ Design intent behind this structuring:
 - **Build setup**: reuse the CMake conventions already established in
   earlier weeks' projects (out-of-source build dir, tests wired via
   CTest) rather than introducing a new build pattern this week.
+- **Line numbering**: assigned exactly once, in `log_loading`, as part of
+  building `vector<RawLine>` — never recomputed downstream. This is a
+  direct consequence of going eager: since the whole file is already being
+  walked in order to build the vector, numbering is free at that point and
+  doesn't need its own pass or a counter threaded through later stages.
+- **Staying in scope**: this week is deliberately C++20-only. No
+  `std::generator`, no C++23/26 ranges additions — those belong to later
+  weeks in the plan. The constraint is useful on its own: it forces the
+  owning-vs-lazy distinction to be made with only C++20 tools, which is
+  exactly what the week is meant to teach.
 
-## 6. Suggested Order of Work
+## 8. Suggested Order of Work
 
-1. Stand up `log_types` and a minimal `log_loading` (read file → vector of
-   strings) with a tiny sample log fixture.
-2. Port/rewrite the Week 1/2 parsing logic into `log_parsing`, returning
-   `std::optional<LogEntry>` per line.
+1. Stand up `log_types` (including `RawLine`) and `log_loading` (read file
+   → `vector<RawLine>`, numbering lines as they're read) with a tiny
+   sample log fixture.
+2. Port/rewrite the Week 1/2 parsing logic into `log_parsing`, taking a
+   `RawLine` and returning `std::optional<LogEntry>`, with `line_number`
+   copied straight through.
 3. Build the loop-based version of the full pipeline first (load → loop →
    filter → parse → count) as the baseline for the benchmark task.
 4. Build `log_pipeline` using `views::filter`/`views::transform`, then layer
@@ -193,3 +356,24 @@ Design intent behind this structuring:
 6. Wire both versions into `main`/`bench` for side-by-side output and
    timing, and write up the readability/behavior comparison.
 7. Add unit tests for parsing, pipeline filtering, and summary correctness.
+8. (Stretch, time permitting) Add severity/timestamp/module filtering and
+   top-N pattern reporting from Section 9, using the same `log_pipeline`
+   style rather than one-off code.
+9. Write the short end-of-week note (task #10).
+
+## 9. Scope for This Week (from the overall plan's suggested features)
+
+The broader weekly plan lists these as suggested features for the log
+analyzer specifically — treat the first two as core scope and the rest as
+stretch goals if time allows within the 5–7 hour weekly budget:
+
+- **Filter by severity, timestamp, or module** — core scope; this is what
+  `by_level`, `in_time_range`, and `by_module` in Section 5 are for.
+- **Extract tokens and aggregate counts** — core scope; this is
+  `log_parsing` + `log_summary`.
+- **Output top errors or suspicious patterns** — stretch; a `top_n` on
+  `LogSummary` that ranks by frequency.
+- **Compare eager materialization with lazy views** — core scope; this is
+  the Task 3 benchmark, and should explicitly show a case where an eager
+  `vector` was built partway through the pipeline (e.g. for the loop-based
+  version) versus a view that stayed lazy until `log_summary` consumed it.
